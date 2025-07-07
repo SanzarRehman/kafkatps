@@ -1,22 +1,31 @@
-# Use Eclipse Temurin Java 24 JDK on Ubuntu Jammy
-FROM eclipse-temurin:24.0.1_9-jdk-ubi9-minimal
+# ---------- BUILD STAGE ----------
+FROM eclipse-temurin:21-jdk-ubi9-minimal AS builder
 
-# Create a non-root user for security (optional but recommended)
-RUN useradd -m appuser
+WORKDIR /workspace
 
-# Set working directory
+# Install tools needed for Gradle (xargs, etc.)
+RUN microdnf install -y findutils
+
+# Copy Gradle files first for Docker layer caching
+COPY build.gradle settings.gradle gradlew /workspace/
+COPY gradle /workspace/gradle
+
+# Download dependencies only
+RUN ./gradlew --no-daemon build -x test
+
+# Copy the full project source after dependencies are cached
+COPY src /workspace/src
+
+# Build the fat jar
+RUN ./gradlew --no-daemon clean jar
+
+# ---------- RUNTIME STAGE ----------
+FROM eclipse-temurin:21-jre-ubi9-minimal
+
 WORKDIR /app
 
-# Copy the fat jar built outside Docker
-COPY kafkatps-0.0.1-SNAPSHOT.jar app.jar
+# Copy only the built jar from the builder stage
+COPY --from=builder /workspace/build/libs/*.jar app.jar
 
-# Fix ownership so appuser can access files
-RUN chown -R appuser:appuser /app
-
-# Switch to non-root user
-USER appuser
-
-# JVM options:
-# -XX:+UseContainerSupport to respect container limits
-# -XX:+ExitOnOutOfMemoryError for safer crashes
-ENTRYPOINT ["java", "-XX:+UseContainerSupport", "-XX:+ExitOnOutOfMemoryError", "-jar", "app.jar"]
+# Run with recommended options for modern JVMs
+ENTRYPOINT ["java", "--enable-preview", "-XX:+ExitOnOutOfMemoryError", "-jar", "app.jar"]

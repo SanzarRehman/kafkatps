@@ -37,6 +37,9 @@ dependencies {
     
     // Spring context only (no Spring Boot) - minimal dependencies for performance
     implementation 'org.springframework:spring-context:6.1.0'
+    
+    // Minimal SLF4J implementation to avoid errors - no actual logging output
+    implementation 'org.slf4j:slf4j-nop:2.0.7'
 }
 
 application {

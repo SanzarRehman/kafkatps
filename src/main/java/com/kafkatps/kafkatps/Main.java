@@ -9,8 +9,7 @@ public class Main {
     private static final CountDownLatch latch = new CountDownLatch(1);
     
     public static void main(String[] args) throws InterruptedException {
-        // Parse command line arguments like .NET version
-        String kafkaServers = "localhost:9092";
+        String kafkaServers = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "10.42.53.125:19092,10.42.53.125:29092,10.42.53.125:39092");
         
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -28,20 +27,19 @@ public class Main {
         }
 
         
-        // Create Spring context for dependency injection
+
         AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
         context.register(R2dbcConfig.class);
         context.refresh();
 
-        // Create high-performance database provider
+
         DatabaseConnectionPoolProvider databaseProvider = context.getBean(DatabaseConnectionPoolProvider.class);
-        
-        // Configure exactly like .NET version with optimized parameters
+
         KafkaMessageConsumerService kafkaConsumerService = new KafkaMessageConsumerService(
-                "disburse-commands-test",   // SAME topic name as .NET
-                50,                       // INCREASED concurrency from 50 to 100 threads
+                "Microfinance.Commands.DisburseCommand",   // SAME topic name as .NET
+                Integer.valueOf(System.getenv().getOrDefault("KAFKA_CONCURRENCY", "50")),                      // INCREASED concurrency from 50 to 100 threads
                 kafkaServers,              // Kafka bootstrap servers
-                "simple",                  // SAME group ID as .NET
+                System.getenv().getOrDefault("KAFKA_GROUP", "simple"),                  // SAME group ID as .NET
                 databaseProvider           // High-performance database provider
         );
 

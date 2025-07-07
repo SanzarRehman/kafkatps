@@ -47,19 +47,19 @@ public class DatabaseConnectionPoolProvider {
         HikariConfig config = new HikariConfig();
         
         // .NET-style connection string converted to JDBC
-        config.setJdbcUrl("jdbc:postgresql://10.44.77.196:5432/microfinance_db");
+        config.setJdbcUrl("jdbc:postgresql://10.42.53.223:5433/microfinance_state_database");
         config.setUsername("postgres");
-        config.setPassword("localpass123");
+        config.setPassword("UAHSq248uwqejadkASJD");
         config.setDriverClassName("org.postgresql.Driver");
         
-        // ULTRA HIGH-PERFORMANCE pool settings for maximum TPS
-        config.setMaximumPoolSize(200);  // Increased from 100 to 200
-        config.setMinimumIdle(100);      // Increased from 50 to 100
-        config.setConnectionTimeout(1000); // Reduced from 3000 to 1000ms
-        config.setIdleTimeout(60000);    // Reduced from 300000 to 60000ms
-        config.setMaxLifetime(600000);   // Reduced from 1800000 to 600000ms
-        config.setLeakDetectionThreshold(30000); // Reduced from 60000 to 30000ms
-        config.setValidationTimeout(1000); // Fast validation
+
+        config.setMaximumPoolSize(Integer.parseInt(System.getenv().getOrDefault("MAXIMUM_DB_POOL", "100")));
+        config.setMinimumIdle(100);
+        config.setConnectionTimeout(1000);
+        config.setIdleTimeout(60000);
+        config.setMaxLifetime(600000);
+        config.setLeakDetectionThreshold(30000);
+        config.setValidationTimeout(1000);
         
         // Performance optimizations
         config.setAutoCommit(true);      // Auto-commit for single operations
@@ -86,7 +86,7 @@ public class DatabaseConnectionPoolProvider {
         return new HikariDataSource(config);
     }
     
-    // INDIVIDUAL ASYNC DATABASE OPERATION - exactly like .NET's async await pattern
+
     public CompletableFuture<Void> insertLoanAsync(UUID memberId, UUID tenantId, UUID verticalId, UUID userId, String language, String serviceId) {
         return CompletableFuture.runAsync(() -> {
             try (Connection connection = dataSource.getConnection();
