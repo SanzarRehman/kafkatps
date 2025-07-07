@@ -25,7 +25,7 @@ public class DatabaseConnectionPoolProvider {
     
     // Pre-compiled SQL for maximum performance - exactly like .NET
     private static final String INSERT_LOAN_SQL = """
-        INSERT INTO loans (
+        INSERT INTO loan_aggregate_roots (
             id, member_id, amount, version, is_marked_to_delete,
             created_date, created_by, language, tenant_id, service_id,
             vertical_id, last_updated_date, last_updated_by
