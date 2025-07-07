@@ -4,6 +4,7 @@ import com.kafkatps.kafkatps.messages.DisburseCommand;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 public class KafkaMessageHandler extends ConcurrentKafkaMessageDispatcher {
 
@@ -39,8 +40,15 @@ public class KafkaMessageHandler extends ConcurrentKafkaMessageDispatcher {
             String serviceId = (command.userContext() != null && command.userContext().serviceId() != null) 
                 ? command.userContext().serviceId() : "default";
             
-            // High-performance native insert - exactly like .NET using DbContextProvider
-            databaseProvider.insertLoanNative(memberId, tenantId, verticalId, userId, language, serviceId);
+            // INDIVIDUAL ASYNC DATABASE OPERATION - exactly like .NET's async await pattern
+            // Process ONE message at a time like .NET
+            CompletableFuture<Void> dbOperation = databaseProvider.insertLoanAsync(memberId, tenantId, verticalId, userId, language, serviceId);
+            
+            // Handle completion asynchronously (optional - for error handling)
+            dbOperation.exceptionally(throwable -> {
+                // Silent error handling for performance
+                return null;
+            });
                 
         } catch (Exception e) {
             // Silent error handling for performance

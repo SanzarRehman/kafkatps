@@ -35,8 +35,8 @@ public abstract class ConcurrentKafkaMessageDispatcher {
         this.concurrency = concurrency;
         this.consumer = consumer;
         
-        // Bounded channel with exact capacity like .NET - prevents memory issues
-        this.channel = new LinkedBlockingQueue<>(concurrency);
+        // ULTRA HIGH-PERFORMANCE bounded channel - increased capacity for batch processing
+        this.channel = new LinkedBlockingQueue<>(concurrency * 10); // 10x capacity for batching
         
         // Create fixed thread pool for workers - exactly like .NET's Task.WhenAll
         this.workerPool = Executors.newFixedThreadPool(concurrency, r -> {
