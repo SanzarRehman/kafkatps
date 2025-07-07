@@ -2,199 +2,206 @@ package com.kafkatps.kafkatps;
 
 import org.apache.kafka.clients.consumer.*;
 import org.apache.kafka.common.TopicPartition;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 public abstract class ConcurrentKafkaMessageDispatcher {
-    private static final Logger logger = LoggerFactory.getLogger(ConcurrentKafkaMessageDispatcher.class);
 
     private final String topicName;
     private final int concurrency;
     private final KafkaConsumer<Void, byte[]> consumer;
-    private final Map<TopicPartition, TreeSet<Long>> completedOffsetsMap = new HashMap<>();
-    private final Map<TopicPartition, AtomicLong> lastCommittedOffsetMap = new HashMap<>();
-    private final Object lock = new Object();
+    
+    // Exact .NET architecture - TreeSet for ordered offset tracking
+    private final TreeSet<Long> completedOffsets = new TreeSet<>();
+    private final AtomicLong lastCommittedOffset = new AtomicLong(-1);
+    private final Object locker = new Object();
+    
+    // Bounded channel with EXACT capacity like .NET - critical for backpressure
+    private final BlockingQueue<ConsumerRecord<Void, byte[]>> channel;
+    private final ExecutorService workerPool;
     private volatile boolean running = false;
+    private TopicPartition topicPartition;
+    
+    // Thread-safe commit tracking
+    private volatile long lastCommitTime = System.currentTimeMillis();
+    private static final long COMMIT_INTERVAL_MS = 1000; // 1 second like .NET
 
     protected ConcurrentKafkaMessageDispatcher(String topicName, int concurrency, KafkaConsumer<Void, byte[]> consumer) {
         this.topicName = topicName;
         this.concurrency = concurrency;
         this.consumer = consumer;
+        
+        // Bounded channel with exact capacity like .NET - prevents memory issues
+        this.channel = new LinkedBlockingQueue<>(concurrency);
+        
+        // Create fixed thread pool for workers - exactly like .NET's Task.WhenAll
+        this.workerPool = Executors.newFixedThreadPool(concurrency, r -> {
+            Thread t = new Thread(r);
+            t.setDaemon(true);
+            t.setName("KafkaWorker-" + t.getId());
+            return t;
+        });
     }
+
+    public abstract void handleAsync(byte[] message);
 
     public void startReactive(AtomicBoolean cancellationToken) {
-        logger.info("Starting Kafka reactive dispatcher on topic '{}' with concurrency {}", topicName, concurrency);
-
         running = true;
-
-        List<TopicPartition> partitions = consumer.partitionsFor(topicName).stream()
-                .map(info -> new TopicPartition(topicName, info.partition()))
-                .toList();
-
-        consumer.assign(partitions);
-        logger.info("Assigned {} partitions: {}", partitions.size(), partitions);
-
-        // Initialize offset tracking for each partition
-        synchronized (lock) {
-            for (TopicPartition partition : partitions) {
-                completedOffsetsMap.put(partition, new TreeSet<>());
-                lastCommittedOffsetMap.put(partition, new AtomicLong(-1));
-            }
-        }
-
-        // Create a single scheduler for Kafka operations to ensure thread safety
-        var kafkaScheduler = Schedulers.newSingle("kafka-consumer");
-
-        // Start periodic offset commit
-        Flux.interval(Duration.ofSeconds(30))
-                .takeWhile(tick -> running && !cancellationToken.get())
-                .subscribeOn(kafkaScheduler)
-                .subscribe(
-                    tick -> tryCommitOffsets(partitions),
-                    error -> logger.error("Error in offset commit scheduler", error),
-                    () -> logger.info("Offset commit scheduler completed")
-                );
-
-        // Main processing loop - use single thread for consumer operations
-        Flux.interval(Duration.ZERO, Duration.ofMillis(100))
-                .takeWhile(tick -> running && !cancellationToken.get())
-                .subscribeOn(kafkaScheduler)
-                .flatMap(tick -> Mono.fromCallable(() -> {
-                    try {
-                        ConsumerRecords<Void, byte[]> records = consumer.poll(Duration.ofMillis(100));
-                        logger.debug("Polled {} records", records.count());
-                        return records;
-                    } catch (Exception e) {
-                        logger.error("Polling failed", e);
-                        return ConsumerRecords.<Void, byte[]>empty();
-                    }
-                }))
-                .filter(records -> !records.isEmpty())
-                .flatMapIterable(records -> records)
-                .flatMap(record ->
-                    handleAsync(record.value())
-                        .doOnSuccess(v -> {
-                            logger.debug("Successfully processed record at offset {} partition {}",
-                                    record.offset(), record.partition());
-                            onRecordProcessed(new TopicPartition(record.topic(), record.partition()), record.offset());
-                        })
-                        .doOnError(e -> logger.error("Error processing record at offset {} partition {}",
-                                record.offset(), record.partition(), e))
-                        .onErrorResume(e -> {
-                            logger.error("Failed to process message, skipping", e);
-                            return Mono.empty();
-                        }),
-                    concurrency)
-                .doOnCancel(() -> {
-                    logger.info("Consumer cancelled");
-                    shutdown(partitions);
-                })
-                .doOnComplete(() -> {
-                    logger.info("Consumer completed");
-                    shutdown(partitions);
-                })
-                .subscribe(
-                    next -> {}, // onNext
-                    error -> {
-                        logger.error("Stream error", error);
-                        shutdown(partitions);
-                    },
-                    () -> logger.info("Stream completed")
-                );
-    }
-
-    private void onRecordProcessed(TopicPartition partition, long offset) {
-        synchronized (lock) {
-            TreeSet<Long> completedOffsets = completedOffsetsMap.get(partition);
-            if (completedOffsets != null) {
-                completedOffsets.add(offset);
-            }
-        }
-    }
-
-    private void tryCommitOffsets(List<TopicPartition> partitions) {
-        try {
-            synchronized (lock) {
-                Map<TopicPartition, OffsetAndMetadata> commitMap = new HashMap<>();
-                for (TopicPartition partition : partitions) {
-                    TreeSet<Long> completedOffsets = completedOffsetsMap.get(partition);
-                    AtomicLong lastCommittedOffset = lastCommittedOffsetMap.get(partition);
-                    if (completedOffsets != null && lastCommittedOffset != null) {
-                        long offset = lastCommittedOffset.get();
-                        while (completedOffsets.contains(offset + 1)) {
-                            offset++;
-                            completedOffsets.remove(offset);
-                        }
-                        if (offset > lastCommittedOffset.get()) {
-                            lastCommittedOffset.set(offset);
-                            commitMap.put(partition, new OffsetAndMetadata(offset + 1));
-                        }
-                    }
-                }
-                if (!commitMap.isEmpty()) {
-                    consumer.commitAsync(commitMap, (offsets, exception) -> {
-                        if (exception != null) {
-                            logger.error("Async commit failed", exception);
-                        } else {
-                            logger.debug("Committed offsets {}", offsets);
-                        }
-                    });
-                }
-            }
-        } catch (Exception e) {
-            logger.error("Error in tryCommitOffsets", e);
-        }
-    }
-
-    private void shutdown(List<TopicPartition> partitions) {
-        if (!running) {
-            return;
-        }
-
-        running = false;
-
-        try {
-            logger.info("Shutting down Kafka dispatcher...");
-
-            // Final offset commit
-            tryCommitOffsets(partitions);
-
-            // Wait a bit for async commits to complete
-            Thread.sleep(1000);
-
-            // Synchronous final commit
-            synchronized (lock) {
-                Map<TopicPartition, OffsetAndMetadata> commitMap = new HashMap<>();
-                for (TopicPartition partition : partitions) {
-                    AtomicLong lastCommittedOffset = lastCommittedOffsetMap.get(partition);
-                    if (lastCommittedOffset != null && lastCommittedOffset.get() >= 0) {
-                        commitMap.put(partition, new OffsetAndMetadata(lastCommittedOffset.get() + 1));
-                    }
-                }
-                if (!commitMap.isEmpty()) {
-                    consumer.commitSync(commitMap);
-                    logger.info("Final sync commit completed");
-                }
-            }
-        } catch (Exception e) {
-            logger.error("Error during shutdown", e);
-        } finally {
+        
+        // Subscribe to topic (like .NET)
+        consumer.subscribe(Collections.singletonList(topicName));
+        
+        // Start main consumer thread - this is the core polling loop
+        workerPool.submit(() -> {
+            boolean workersStarted = false;
+            
             try {
-                consumer.close();
+                while (!cancellationToken.get() && running) {
+                    ConsumerRecords<Void, byte[]> records = consumer.poll(Duration.ofMillis(100));
+                    
+                    // Only start workers when we actually have messages - lazy initialization
+                    if (!records.isEmpty() && !workersStarted) {
+                        // Initialize offset tracking with first message
+                        ConsumerRecord<Void, byte[]> firstRecord = records.iterator().next();
+                        lastCommittedOffset.set(firstRecord.offset() - 1);
+                        this.topicPartition = new TopicPartition(firstRecord.topic(), firstRecord.partition());
+                        
+                        // Now start worker threads - exactly like .NET's DispatchMessagesAsync
+                        startWorkerThreads();
+                        workersStarted = true;
+                    }
+                    
+                    // Process messages only if workers are started
+                    if (workersStarted) {
+                        for (ConsumerRecord<Void, byte[]> record : records) {
+                            if (topicPartition == null) {
+                                topicPartition = new TopicPartition(record.topic(), record.partition());
+                            }
+                            
+                            // Blocking put with timeout - provides natural backpressure like .NET's bounded channel
+                            while (running && !channel.offer(record, 1, TimeUnit.SECONDS)) {
+                                // Backpressure - wait
+                            }
+                        }
+                    }
+                    
+                    // THREAD-SAFE COMMIT: Handle commits on the same thread as polling
+                    if (workersStarted && System.currentTimeMillis() - lastCommitTime > COMMIT_INTERVAL_MS) {
+                        commitOffsetsOnConsumerThread();
+                        lastCommitTime = System.currentTimeMillis();
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
-                logger.error("Error closing consumer", e);
+                // Silent error handling for performance
+            } finally {
+                // Send shutdown markers to all workers only if they were started
+                if (workersStarted) {
+                    for (int i = 0; i < concurrency; i++) {
+                        try {
+                            channel.offer(createShutdownMarker(), 1, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                    
+                    // Final commit on consumer thread
+                    commitOffsetsOnConsumerThread();
+                }
             }
-            logger.info("Kafka dispatcher shutdown complete.");
+        });
+    }
+
+    private void startWorkerThreads() {
+        for (int i = 0; i < concurrency; i++) {
+            final int workerId = i;
+            workerPool.submit(() -> {
+                while (running && !Thread.currentThread().isInterrupted()) {
+                    try {
+                        ConsumerRecord<Void, byte[]> record = channel.poll(1, TimeUnit.SECONDS);
+                        
+                        if (record != null) {
+                            // Check for shutdown marker
+                            if (record.offset() == -1) {
+                                break;
+                            }
+                            
+                            try {
+                                // Process message - exactly like .NET's HandleAsync
+                                handleAsync(record.value());
+                                
+                                // Mark as completed for offset management - exactly like .NET
+                                synchronized (locker) {
+                                    completedOffsets.add(record.offset());
+                                }
+                                
+                            } catch (Exception e) {
+                                // Silent error handling for performance
+                            }
+                        }
+                        
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    } catch (Exception e) {
+                        // Silent error handling for performance
+                    }
+                }
+            });
         }
     }
 
-    public abstract Mono<Void> handleAsync(byte[] message);
+    // THREAD-SAFE: This method runs on the consumer thread, so it's safe to call consumer.commitSync
+    private void commitOffsetsOnConsumerThread() {
+        try {
+            synchronized (locker) {
+                long offset = lastCommittedOffset.get();
+                
+                // Find consecutive completed offsets - EXACTLY like .NET algorithm
+                while (completedOffsets.contains(offset + 1)) {
+                    offset++;
+                    completedOffsets.remove(offset);
+                }
+                
+                if (offset > lastCommittedOffset.get()) {
+                    lastCommittedOffset.set(offset);
+                    
+                    if (topicPartition != null) {
+                        Map<TopicPartition, OffsetAndMetadata> commitMap = new HashMap<>();
+                        commitMap.put(topicPartition, new OffsetAndMetadata(offset + 1));
+                        consumer.commitSync(commitMap);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Silent error handling for performance
+        }
+    }
+
+    public void shutdown() {
+        if (!running) return;
+        
+        running = false;
+        
+        try {
+            // Stop worker pool
+            workerPool.shutdown();
+            workerPool.awaitTermination(10, TimeUnit.SECONDS);
+            
+            consumer.close();
+            
+        } catch (Exception e) {
+            // Silent error handling for performance
+        }
+    }
+
+    private ConsumerRecord<Void, byte[]> createShutdownMarker() {
+        return new ConsumerRecord<>(topicName, 0, -1, null, new byte[0]);
+    }
 }
